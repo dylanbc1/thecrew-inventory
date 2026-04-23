@@ -1,6 +1,7 @@
 """Inventory Service — FastAPI app for The Crew Autos vehicle inventory.
 
-Scrapes thecrewautos.com, persists to SQLite, serves via authenticated API.
+Scrapes thecrewautos.com, persists to PostgreSQL, serves via authenticated API.
+Auto-scrapes when data is stale (> CACHE_TTL_MINUTES since last scrape).
 """
 
 from __future__ import annotations
@@ -34,6 +35,31 @@ app = FastAPI(title="Inventory Service — The Crew Autos", version="0.1.0")
 async def startup():
     init_db()
     logger.info("db_initialized")
+
+
+# ── Internal: ensure fresh data ──────────────────────────────────
+
+async def _ensure_fresh() -> None:
+    """Scrape if no data or last scrape is older than TTL."""
+    settings = get_settings()
+    last = last_successful_run()
+
+    if last and last.get("completed_at"):
+        completed = datetime.fromisoformat(last["completed_at"])
+        age_minutes = (datetime.now(timezone.utc) - completed).total_seconds() / 60
+        if age_minutes < settings.cache_ttl_minutes:
+            return  # fresh enough
+
+    logger.info("data_stale — triggering scrape")
+    run_id = start_run()
+    try:
+        vehicles = await scrape(settings.scrape_url)
+        count = upsert_vehicles(vehicles)
+        finish_run(run_id, count, "success")
+        logger.info("auto_scrape_done count=%d", count)
+    except Exception:
+        logger.exception("auto_scrape_failed")
+        finish_run(run_id, 0, "failed")
 
 
 # ── Health (no auth) ─────────────────────────────────────────────
@@ -82,11 +108,13 @@ async def trigger_scrape(force: bool = Query(False)):
 
 @app.get("/vehicles", dependencies=[Depends(require_api_key)])
 async def list_vehicles(
-    q: Optional[str] = Query(None, description="Search text"),
-    make: Optional[str] = Query(None),
-    max_price: Optional[int] = Query(None),
-    include_unavailable: bool = Query(False),
+    q: Optional[str] = Query(None, description="Search by year, make, or model"),
+    make: Optional[str] = Query(None, description="Filter by make (e.g. Bmw)"),
+    max_price: Optional[int] = Query(None, description="Max price in dollars"),
+    include_unavailable: bool = Query(False, description="Include sold/removed vehicles"),
 ):
+    """List vehicles. Auto-scrapes if data is stale (>10min since last scrape)."""
+    await _ensure_fresh()
     vehicles = get_vehicles(
         available_only=not include_unavailable,
         make=make,
@@ -98,6 +126,7 @@ async def list_vehicles(
 
 @app.get("/vehicles/{vin}", dependencies=[Depends(require_api_key)])
 async def get_vehicle(vin: str):
+    """Get a single vehicle by VIN."""
     v = get_vehicle_by_vin(vin)
     if not v:
         raise HTTPException(status_code=404, detail="Vehicle not found")
