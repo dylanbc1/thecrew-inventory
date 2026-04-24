@@ -4,6 +4,5 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9
-scrapling>=0.2.9
+scrapling[all]>=0.2.9
 camoufox>=0.4
-curl_cffi>=0.7.0
