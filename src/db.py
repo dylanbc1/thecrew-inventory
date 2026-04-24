@@ -1,12 +1,14 @@
-"""PostgreSQL persistence for scraped inventory.
+"""PostgreSQL persistence for scraped inventory and market comparisons.
 
 Tables:
 - vehicles: one row per VIN, updated on each scrape
 - scrape_runs: log of every scrape attempt for cache/audit
+- market_comparisons: cached market comparison results (TTL 24h)
 """
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -47,6 +49,25 @@ def init_db() -> None:
                     completed_at    TIMESTAMPTZ,
                     vehicles_found  INTEGER DEFAULT 0,
                     status          TEXT DEFAULT 'running'
+                );
+
+                CREATE TABLE IF NOT EXISTS market_comparisons (
+                    id              SERIAL PRIMARY KEY,
+                    lookup_key      TEXT UNIQUE NOT NULL,
+                    year            TEXT,
+                    make            TEXT,
+                    model           TEXT,
+                    our_price       INTEGER,
+                    market_avg      INTEGER,
+                    market_min      INTEGER,
+                    market_max      INTEGER,
+                    listing_count   INTEGER DEFAULT 0,
+                    savings_vs_avg  INTEGER DEFAULT 0,
+                    savings_pct     REAL DEFAULT 0,
+                    deal_rating     TEXT,
+                    advantages      JSONB DEFAULT '[]',
+                    raw_data        JSONB DEFAULT '{}',
+                    scraped_at      TIMESTAMPTZ
                 );
             """)
         conn.commit()
@@ -207,5 +228,89 @@ def get_vehicle_by_vin(vin: str) -> Optional[Dict]:
                         d[k] = d[k].isoformat()
                 return d
             return None
+    finally:
+        conn.close()
+
+
+# ── Market Comparisons ─────────────────────────────────────────
+
+_MARKET_CACHE_HOURS = 24  # market data valid for 24h
+
+
+def _market_key(year: str, make: str, model: str) -> str:
+    return f"{year}|{make.lower().strip()}|{model.lower().strip()}"
+
+
+def get_cached_comparison(year: str, make: str, model: str) -> Optional[Dict]:
+    """Return cached market comparison if fresh (< 24h old)."""
+    key = _market_key(year, make, model)
+    conn = _conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM market_comparisons WHERE lookup_key = %s", (key,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            d = dict(row)
+            scraped = d.get("scraped_at")
+            if scraped and hasattr(scraped, "timestamp"):
+                age_hours = (datetime.now(timezone.utc) - scraped).total_seconds() / 3600
+                if age_hours > _MARKET_CACHE_HOURS:
+                    return None  # stale
+
+            # Deserialize
+            if d.get("scraped_at") and hasattr(d["scraped_at"], "isoformat"):
+                d["scraped_at"] = d["scraped_at"].isoformat()
+            d["competitive_advantages"] = d.pop("advantages", [])
+            d["comparable_listings"] = (d.pop("raw_data", {}) or {}).get("listings", [])
+            d["status"] = "ok"
+            d.pop("id", None)
+            d.pop("lookup_key", None)
+            return d
+    finally:
+        conn.close()
+
+
+def save_comparison(data: Dict) -> None:
+    """Upsert market comparison results."""
+    key = _market_key(data.get("year", ""), data.get("make", ""), data.get("model", ""))
+    now = datetime.now(timezone.utc)
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO market_comparisons
+                    (lookup_key, year, make, model, our_price, market_avg, market_min,
+                     market_max, listing_count, savings_vs_avg, savings_pct, deal_rating,
+                     advantages, raw_data, scraped_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (lookup_key) DO UPDATE SET
+                    our_price=EXCLUDED.our_price, market_avg=EXCLUDED.market_avg,
+                    market_min=EXCLUDED.market_min, market_max=EXCLUDED.market_max,
+                    listing_count=EXCLUDED.listing_count, savings_vs_avg=EXCLUDED.savings_vs_avg,
+                    savings_pct=EXCLUDED.savings_pct, deal_rating=EXCLUDED.deal_rating,
+                    advantages=EXCLUDED.advantages, raw_data=EXCLUDED.raw_data,
+                    scraped_at=EXCLUDED.scraped_at
+            """, (
+                key,
+                data.get("year", ""),
+                data.get("make", ""),
+                data.get("model", ""),
+                data.get("our_price", 0),
+                data.get("market_avg", 0),
+                data.get("market_min", 0),
+                data.get("market_max", 0),
+                data.get("listing_count", 0),
+                data.get("savings_vs_avg", 0),
+                data.get("savings_pct", 0),
+                data.get("deal_rating", ""),
+                json.dumps(data.get("competitive_advantages", [])),
+                json.dumps({"listings": data.get("comparable_listings", [])}),
+                now,
+            ))
+        conn.commit()
     finally:
         conn.close()

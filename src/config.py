@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://localhost:5432/inventory"
     scrape_url: str = "https://www.thecrewautos.com/inventory/"
     cache_ttl_minutes: int = 10
+    market_cache_hours: int = 24
 
 
 @lru_cache

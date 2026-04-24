@@ -16,13 +16,16 @@ from src.auth import require_api_key
 from src.config import get_settings
 from src.db import (
     finish_run,
+    get_cached_comparison,
     get_vehicle_by_vin,
     get_vehicles,
     init_db,
     last_successful_run,
+    save_comparison,
     start_run,
     upsert_vehicles,
 )
+from src.market_scraper import scrape_market_comparison
 from src.scraper import scrape
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -131,3 +134,71 @@ async def get_vehicle(vin: str):
     if not v:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     return v
+
+
+# ── Market Comparison ───────────────────────────────────────────
+
+@app.get("/market-compare", dependencies=[Depends(require_api_key)])
+async def market_compare(
+    year: str = Query(..., description="Vehicle year (e.g. 2013)"),
+    make: str = Query(..., description="Vehicle make (e.g. Honda)"),
+    model: str = Query(..., description="Vehicle model (e.g. Civic)"),
+    our_price: str = Query("0", description="Our price for comparison (e.g. $9,685 or 9685)"),
+    force: bool = Query(False, description="Force fresh scrape ignoring cache"),
+):
+    """Compare a vehicle against the market (Cars.com within 100mi of Alpharetta).
+
+    Returns market average, savings, deal rating, and comparable listings.
+    Results are cached for 24 hours per year/make/model combination.
+    """
+    if not force:
+        cached = get_cached_comparison(year, make, model)
+        if cached:
+            logger.info("market_compare_cached year=%s make=%s model=%s", year, make, model)
+            # Recalculate with current our_price if different
+            from src.market_scraper import _parse_price, _compute_analysis
+            current_our = _parse_price(our_price) or 0
+            if current_our > 0 and cached.get("our_price") != current_our:
+                cached["our_price"] = current_our
+                if cached.get("market_avg"):
+                    cached["savings_vs_avg"] = cached["market_avg"] - current_our
+                    cached["savings_pct"] = round(
+                        cached["savings_vs_avg"] / cached["market_avg"] * 100, 1
+                    )
+            cached["source"] = "cache"
+            return cached
+
+    logger.info("market_compare_scraping year=%s make=%s model=%s", year, make, model)
+    result = await scrape_market_comparison(year, make, model, our_price)
+
+    # Cache the result if successful
+    if result.get("status") == "ok":
+        try:
+            save_comparison(result)
+        except Exception:
+            logger.warning("market_compare_cache_save_failed")
+
+    result["source"] = "fresh"
+    return result
+
+
+@app.get("/market-compare/vin/{vin}", dependencies=[Depends(require_api_key)])
+async def market_compare_by_vin(
+    vin: str,
+    force: bool = Query(False),
+):
+    """Compare a vehicle from our inventory against the market, by VIN.
+
+    Automatically looks up the vehicle's year/make/model/price from our DB.
+    """
+    vehicle = get_vehicle_by_vin(vin)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found in our inventory")
+
+    return await market_compare(
+        year=vehicle.get("year", ""),
+        make=vehicle.get("make", ""),
+        model=vehicle.get("model", ""),
+        our_price=vehicle.get("price", "0"),
+        force=force,
+    )
